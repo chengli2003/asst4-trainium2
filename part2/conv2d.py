@@ -68,11 +68,58 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     c_in_pmax = nl.tile_size.pmax
     n_tiles_c_in = in_channels // c_in_pmax
 
+    X_re = X.reshape((batch_size, in_channels, input_height * input_width))
+    X_out = X_out.reshape((batch_size, out_channels, out_pool_height * out_pool_width))
+
     # Process the images in batches
     for b in nl.affine_range(batch_size):
-        raise RuntimeError("Please fill your implementation of computing convolution"
-                           " of X[b] with the weights W and bias b, followed by a"
-                           " maxpool and store the result in X_out[b]")
+
+        X_single = X_re[b]
+
+        # Initialize convolution output
+        conv_output = nl.zeros((out_channels, out_height * out_width), dtype=X_single.dtype, buffer=nl.sbuf)
+        
+        # Process convolution following the algorithm pseudocode
+        for i in nl.affine_range(filter_height):
+            for j in nl.affine_range(filter_width):
+                
+                # Create shifted input tensor in HBM
+                input_shifted = nl.ndarray((in_channels, out_height * out_width), dtype=X_single.dtype, buffer=nl.hbm)
+
+                # Populate the shifted input tensor
+                # For each output position (out_h, out_w), we take input at (out_h + i, out_w + j)
+                for out_h in nl.affine_range(out_height):
+                    for out_w in nl.affine_range(out_width):
+                        # Input position after applying shift (i, j)
+                        in_h = out_h + i
+                        in_w = out_w + j
+                        in_idx = in_h * input_width + in_w
+                        out_idx = out_h * out_width + out_w
+                        
+                        # Copy all channels for this spatial position
+                        nisa.dma_copy(src=X_single[:, in_idx:in_idx+1], 
+                                  dst=input_shifted[:, out_idx:out_idx+1])
+                
+                # Get the weight slice for position (i, j)
+                weight_slice = W[:, :, i, j]  # Shape: (out_channels, in_channels)
+                weight_slice_T = nisa.dma_transpose(weight_slice)  # Shape: (in_channels, out_channels)
+                
+                temp_result = nl.ndarray((out_channels, out_height * out_width), dtype=X_single.dtype, buffer=nl.sbuf)
+                
+                print("weight_slice_T shape:", weight_slice_T.shape)
+                print("input_shifted shape:", input_shifted.shape)
+
+
+                # Perform tiled matrix multiplication
+                nki_matmul_tiled_(weight_slice_T, input_shifted, temp_result)
+                
+                # Add to accumulated convolution output
+                conv_output += temp_result
+
+        # copy over to X_out
+        # nl.device_print("value of conv_output:", conv_output)
+        nisa.dma_copy(src=conv_output, dst=X_out[b])
+    X_out = X_out.reshape((batch_size, out_channels, out_pool_height, out_pool_width))
 
     return X_out
 
