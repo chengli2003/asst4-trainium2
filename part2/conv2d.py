@@ -65,222 +65,82 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     )
 
     # Various tiling dimensions (You may want to define more of them)
-    c_in_pmax = nl.tile_size.pmax
-    n_tiles_c_in = in_channels // c_in_pmax
+    TILE_OUT_C = nl.tile_size.gemm_stationary_fmax  # 128 (output channels)
+    TILE_IN_C = nl.tile_size.pmax  # 128 (input channels)
+    TILE_H = nl.tile_size.gemm_moving_fmax // input_width
+    TILE_W = input_width
+    TILE_OUT_H = TILE_H - filter_height + 1
+    TILE_OUT_W = TILE_W - filter_width + 1
 
-    X_re = X.reshape((batch_size, in_channels, input_height * input_width))
-    X_out = X_out.reshape((batch_size, out_channels, out_pool_height * out_pool_width))
+
+    #     TILE_OUT_C = nl.tile_size.gemm_stationary_fmax  # 128 (output channels)
+    # TILE_IN_C = nl.tile_size.pmax  # 128 (input channels)
+    # TILE_OUT_H = nl.tile_size.gemm_moving_fmax // out_width
+    # TILE_IN_H = TILE_OUT_H + filter_height - 1
+
+    # # Calculate number of tiles
+    # n_tiles_out_ch = out_channels // TILE_OUT_C
+    # n_tiles_in_ch = in_channels // TILE_IN_C
+    # n_tile_out_h = output_height // TILE_OUT_H
+
+    # Calculate number of tiles
+    n_tiles_out_ch = out_channels // TILE_OUT_C
+    n_tiles_in_ch = in_channels // TILE_IN_C
+    n_tile_h = input_height // TILE_H
+
+    # print(f"Fused Conv2D-MaxPool Tiling Info:"
+    #       f"\nTILE_OUT_C: {TILE_OUT_C}, n_tiles_out_ch: {n_tiles_out_ch}"
+    #       f"\nTILE_IN_C: {TILE_IN_C}, n_tiles_in_ch: {n_tiles_in_ch}"
+    #       f"\nTILE_H: {TILE_H}, TILE_W: {TILE_W}, n_tile_h: {n_tile_h}"
+    #       f"\nTILE_OUT_H: {TILE_OUT_H}, TILE_OUT_W: {TILE_OUT_W}"
+    #     )
 
     # Process the images in batches
     for b in nl.affine_range(batch_size):
+        for tile_out_ch in nl.affine_range(n_tiles_out_ch):
+            for tile_h in nl.affine_range(n_tile_h):
+                
+                # Allocate PSUM for this output tile
+                output_tile_psum = nl.zeros((TILE_OUT_C, TILE_OUT_H, TILE_OUT_W), nl.float32, buffer=nl.psum)
+                
+                for tile_in_ch in nl.affine_range(n_tiles_in_ch):
 
-        X_single = X_re[b]
+                    input_tile = nl.ndarray((TILE_IN_C, TILE_H, TILE_W), dtype=X.dtype, buffer=nl.sbuf)
+                    ch_start = tile_in_ch * TILE_IN_C
+                    ch_end = (tile_in_ch + 1) * TILE_IN_C
+                    h_start = tile_h * TILE_H
+                    h_end = (tile_h + 1) * TILE_H
+                    nisa.dma_copy(src=X[b, ch_start:ch_end, h_start:h_end, :], dst=input_tile)
 
-        # Initialize convolution output
-        conv_output = nl.zeros((out_channels, out_height * out_width), dtype=X_single.dtype, buffer=nl.sbuf)
+                    # Get weight tile to SBUF and transpose
+                    out_ch_start = tile_out_ch * TILE_OUT_C
+                    out_ch_end = (tile_out_ch + 1) * TILE_OUT_C
+                    # weight_tile = nl.ndarray((TILE_OUT_C, TILE_IN_C, filter_height, filter_width), dtype=W.dtype, buffer=nl.hbm)
+                    # nisa.dma_copy(src=W[out_ch_start:out_ch_end, ch_start:ch_end, :, :], dst=weight_tile)
+                    # weight_tile_T = matrix_transpose(weight_tile.reshape((TILE_OUT_C, TILE_IN_C * filter_height * filter_width))).reshape((TILE_IN_C, TILE_OUT_C, filter_height, filter_width))
+                    # # copy back to sbuf
+                    # weight_tile_T_sbuf = nl.ndarray((TILE_IN_C, TILE_OUT_C, filter_height, filter_width), dtype=W.dtype, buffer=nl.sbuf)
+                    # nisa.dma_copy(src=weight_tile_T, dst=weight_tile_T_sbuf)
         
-        # Process convolution following the algorithm pseudocode
-        for i in nl.affine_range(filter_height):
-            for j in nl.affine_range(filter_width):
-                
-                # Create input_shifted with dimensions (in_channels, in_height * in_width)
-                # This represents the relevant input positions for this filter position (i, j)
-                input_shifted = nl.zeros((in_channels, input_height * input_width), dtype=X_single.dtype, buffer=nl.sbuf)
-                
-                # For each valid output position, extract the corresponding input position
-                for out_h in nl.affine_range(out_height):
-                    for out_w in nl.affine_range(out_width):
-                        # The input position for this output position with filter offset (i, j)
-                        in_h = out_h + i
-                        in_w = out_w + j
-                        in_idx = in_h * input_width + in_w
-                        out_idx = out_h * out_width + out_w
-                        
-                        # Copy all channels for this spatial position
-                        nisa.dma_copy(src=X_single[:, in_idx:in_idx+1], 
-                                      dst=input_shifted[:, out_idx:out_idx+1])
-                
-                # Get the weight slice for position (i, j)
-                weight_slice = W[:, :, i, j]  # Shape: (out_channels, in_channels)
-                weight_slice_T = matrix_transpose(weight_slice)  # Shape: (in_channels, out_channels)
-                
-                temp_result = nl.ndarray((out_channels, input_height * input_width), dtype=X_single.dtype, buffer=nl.sbuf)
-                
-                # Perform tiled matrix multiplication: weight_slice_T @ input_shifted
-                nki_matmul_tiled_(weight_slice_T, input_shifted, temp_result)
+                    for i in nl.affine_range(filter_height):
+                        for j in nl.affine_range(filter_width):
+                            weight_tile = nl.ndarray((TILE_OUT_C, TILE_IN_C), dtype=W.dtype, buffer=nl.sbuf)
+                            nisa.dma_copy(src=W[out_ch_start:out_ch_end, ch_start:ch_end, i, j], dst=weight_tile)
+                            weight_tile_T_psum = nisa.nc_transpose(weight_tile)
+                            weight_tile_T = nisa.tensor_copy(src=weight_tile_T_psum)
+                            output_tile_psum += nisa.nc_matmul(weight_tile_T, input_tile[:, i : i + TILE_OUT_H, j : j + TILE_OUT_W])
 
-                # nl.device_print("value of temp_result:", temp_result)
-                
-                # Extract the valid output region from temp_result and add to conv_output
-                for out_h in nl.affine_range(out_height):
-                    for out_w in nl.affine_range(out_width):
-                        out_idx = out_h * out_width + out_w
-                        
-                        # Add the result for this spatial position to conv_output
-                        for c in nl.affine_range(out_channels):
-                            conv_output[c, out_idx] += temp_result[c, out_idx]
-
-        # copy over to X_out
-        # nl.device_print("value of conv_output:", conv_output)
-        nisa.dma_copy(src=conv_output, dst=X_out[b])
-    X_out = X_out.reshape((batch_size, out_channels, out_pool_height, out_pool_width))
+                # copy from PSUM to SBUF (after all input channels are accumulated)
+                output_tile = nisa.tensor_copy(src=output_tile_psum)
+                # Write back the output tile to the output tensor
+                out_h_start = tile_h * TILE_OUT_H
+                out_h_end = (tile_h + 1) * TILE_OUT_H
+                # print("output_tile shape:", output_tile.shape)
+                nisa.dma_copy(src=output_tile, dst=X_out[b, out_ch_start:out_ch_end, out_h_start:out_h_end, :])
 
     return X_out
 
 
-
-# # Helper function to process a single image
-# """
-# X_single: shape (in_channels, input_height * input_width)
-# output_single: shape (out_channels, out_pool_height * out_pool_width)
-# """
-# @nki.compiler.skip_middle_end_transformations
-# @nki.jit 
-# def fused_conv2d_maxpool_single_image(X_single, W, bias, output_single, pool_size, input_height, input_width):
-#     """Process a single image through convolution and maxpool"""
-    
-#     in_channels, _ = X_single.shape
-#     out_channels, _, filter_height, filter_width = W.shape
-    
-#     out_height = input_height - filter_height + 1
-#     out_width = input_width - filter_width + 1
-    
-#     out_pool_height = out_height // pool_size
-#     out_pool_width = out_width // pool_size
-
-#     # Initialize convolution output
-#     conv_output = nl.ndarray(output_single.shape, dtype=X_single.dtype, buffer=nl.sbuf)
-#     for c in nl.affine_range(out_channels):
-#         for i in nl.affine_range(out_height * out_width):
-#             conv_output[c, i] = 0.0
-    
-#     # Process convolution following the algorithm pseudocode
-#     for i in nl.affine_range(filter_height):
-#         for j in nl.affine_range(filter_width):
-            
-#             # Create shifted input tensor in HBM
-#             input_shifted = nl.ndarray((in_channels, out_height * out_width), dtype=X_single.dtype, buffer=nl.hbm)
-
-#             # Populate the shifted input tensor
-#             # For each output position (out_h, out_w), we take input at (out_h + i, out_w + j)
-#             for out_h in nl.affine_range(out_height):
-#                 for out_w in nl.affine_range(out_width):
-#                     # Input position after applying shift (i, j)
-#                     in_h = out_h + i
-#                     in_w = out_w + j
-#                     in_idx = in_h * input_width + in_w
-#                     out_idx = out_h * out_width + out_w
-                    
-#                     # Copy all channels for this spatial position
-#                     nisa.dma_copy(src=X_single[:, in_idx:in_idx+1], 
-#                                   dst=input_shifted[:, out_idx:out_idx+1])
-            
-#             # Get the weight slice for position (i, j)
-#             weight_slice = W[:, :, i, j]  # Shape: (out_channels, in_channels)
-#             weight_slice_T = nisa.dma_transpose(weight_slice)  # Shape: (in_channels, out_channels)
-            
-#             temp_result = nl.ndarray((out_channels, out_height * out_width), dtype=X_single.dtype, buffer=nl.sbuf)
-            
-#             # Perform tiled matrix multiplication
-#             nki_matmul_tiled_(weight_slice_T, input_shifted, temp_result)
-            
-#             # Add to accumulated convolution output
-#             # Since we're accumulating across loop indices i,j, we need to be careful with dependencies
-#             # Use element-wise addition directly to HBM to avoid dependency issues
-#             for c in nl.affine_range(out_channels):
-#                 for spatial_idx in nl.affine_range(out_height * out_width):
-#                     conv_output[c, spatial_idx] += temp_result[c, spatial_idx]
-
-    # copy over to output_single
-    # nisa.dma_copy(src=conv_output, dst=output_single)
-
-    
-    # # Add bias to convolution result
-    # for c in nl.affine_range(out_channels):
-    #     for spatial_idx in nl.affine_range(out_height * out_width):
-    #         conv_output[c, spatial_idx] += bias[c]
-    
-    # # Apply maxpooling
-    # if pool_size == 1:
-    #     # No pooling, copy convolution output directly to final output
-    #     # Convert flattened conv_output to 3D layout for output_single
-    #     for c in nl.affine_range(out_channels):
-    #         for h in nl.affine_range(out_height):
-    #             for w in nl.affine_range(out_width):
-    #                 spatial_idx = h * out_width + w
-    #                 output_single[c, h, w] = conv_output[c, spatial_idx]
-    # else:
-    #     # Apply 2x2 max pooling
-    #     # Process each output channel and pooled position
-    #     for c in nl.affine_range(out_channels):
-    #         for ph in nl.affine_range(out_pool_height):
-    #             for pw in nl.affine_range(out_pool_width):
-    #                 # Get 2x2 window starting positions
-    #                 h_start = ph * 2
-    #                 w_start = pw * 2
-                    
-    #                 # Extract the 2x2 window values from flattened conv_output
-    #                 idx_00 = h_start * out_width + w_start
-    #                 idx_01 = h_start * out_width + (w_start + 1)
-    #                 idx_10 = (h_start + 1) * out_width + w_start
-    #                 idx_11 = (h_start + 1) * out_width + (w_start + 1)
-                    
-    #                 val_00 = conv_output[c, idx_00]
-    #                 val_01 = conv_output[c, idx_01]
-    #                 val_10 = conv_output[c, idx_10]
-    #                 val_11 = conv_output[c, idx_11]
-                    
-    #                 # Find maximum manually since tensor operations might not work for scalars
-    #                 max_val = val_00
-    #                 if val_01 > max_val:
-    #                     max_val = val_01
-    #                 if val_10 > max_val:
-    #                     max_val = val_10
-    #                 if val_11 > max_val:
-    #                     max_val = val_11
-                    
-    #                 output_single[c, ph, pw] = max_val
-
-
-@nki.compiler.skip_middle_end_transformations
-@nki.jit
-def nki_matmul_tiled_(lhsT, rhs, result):
-    """NKI kernel to compute a matrix multiplication operation in a tiled manner"""
-
-    K, M = lhsT.shape
-    K_, N = rhs.shape
-    assert K == K_, "lhsT and rhs must have the same contraction dimension"
-
-    # Maximum free dimension of the stationary operand of general matrix multiplication on tensor engine
-    TILE_M = nl.tile_size.gemm_stationary_fmax  # 128
-
-    # Maximum partition dimension of a tile
-    TILE_K = nl.tile_size.pmax  # 128
-
-    # Maximum free dimension of the moving operand of general matrix multiplication on tensor engine
-    TILE_N = nl.tile_size.gemm_moving_fmax  # 512
-
-    # Use affine_range to loop over tiles
-    for m in nl.affine_range(M // TILE_M):
-        for n in nl.affine_range(N // TILE_N):
-            # Allocate a tensor in PSUM
-            res_psum = nl.zeros((TILE_M, TILE_N), nl.float32, buffer=nl.psum)
-
-            for k in nl.affine_range(K // TILE_K):
-                # Declare the tiles on SBUF
-                lhsT_tile = nl.ndarray((TILE_K, TILE_M), dtype=lhsT.dtype, buffer=nl.sbuf)
-                rhs_tile = nl.ndarray((TILE_K, TILE_N), dtype=rhs.dtype, buffer=nl.sbuf)
-
-                # Load tiles from lhsT and rhs
-                nisa.dma_copy(dst=lhsT_tile, src=lhsT[k * TILE_K:(k + 1) * TILE_K, m * TILE_M:(m + 1) * TILE_M])
-                nisa.dma_copy(dst=rhs_tile, src=rhs[k * TILE_K:(k + 1) * TILE_K, n * TILE_N:(n + 1) * TILE_N])
-
-                # Accumulate partial-sums into PSUM
-                res_psum += nisa.nc_matmul(lhsT_tile, rhs_tile)
-
-            # Copy the result from PSUM back to SBUF, and cast to expected output data-type
-            res_sb = nl.copy(res_psum, dtype=result.dtype)
-            nisa.dma_copy(dst=result[m * TILE_M:(m + 1) * TILE_M, n * TILE_N:(n + 1) * TILE_N], src=res_sb)
 
 """
 This kernel implements a simple 2D matrix transpose.
@@ -296,7 +156,6 @@ def matrix_transpose(a_tensor):
 
     assert M % tile_dim == N % tile_dim == 0, "Matrix dimensions not divisible by tile dimension!"
 
-    # TODO: Your implementation here. The only compute instruction you should use is `nisa.nc_transpose`.
     for m in nl.affine_range(M // tile_dim):
         for n in nl.affine_range(N // tile_dim):
             # Allocate space for the input tile
