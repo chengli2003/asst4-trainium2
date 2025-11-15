@@ -67,37 +67,28 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     # Various tiling dimensions (You may want to define more of them)
     TILE_OUT_C = nl.tile_size.gemm_stationary_fmax  # 128 (output channels)
     TILE_IN_C = nl.tile_size.pmax  # 128 (input channels)
-    TILE_H = nl.tile_size.gemm_moving_fmax // input_width
-    TILE_W = input_width
-    TILE_OUT_H = TILE_H - filter_height + 1
-    TILE_OUT_W = TILE_W - filter_width + 1
-
-
-    #     TILE_OUT_C = nl.tile_size.gemm_stationary_fmax  # 128 (output channels)
-    # TILE_IN_C = nl.tile_size.pmax  # 128 (input channels)
-    # TILE_OUT_H = nl.tile_size.gemm_moving_fmax // out_width
-    # TILE_IN_H = TILE_OUT_H + filter_height - 1
-
-    # # Calculate number of tiles
-    # n_tiles_out_ch = out_channels // TILE_OUT_C
-    # n_tiles_in_ch = in_channels // TILE_IN_C
-    # n_tile_out_h = output_height // TILE_OUT_H
+    TILE_OUT_H = min(nl.tile_size.gemm_moving_fmax // out_width, out_height)
+    TILE_OUT_W = out_width
+    TILE_IN_H = TILE_OUT_H + filter_height - 1
+    TILE_IN_W = input_width
 
     # Calculate number of tiles
     n_tiles_out_ch = out_channels // TILE_OUT_C
     n_tiles_in_ch = in_channels // TILE_IN_C
-    n_tile_h = input_height // TILE_H
+    n_tile_h = out_height // TILE_OUT_H
 
     # print(f"Fused Conv2D-MaxPool Tiling Info:"
     #       f"\nTILE_OUT_C: {TILE_OUT_C}, n_tiles_out_ch: {n_tiles_out_ch}"
-    #       f"\nTILE_IN_C: {TILE_IN_C}, n_tiles_in_ch: {n_tiles_in_ch}"
-    #       f"\nTILE_H: {TILE_H}, TILE_W: {TILE_W}, n_tile_h: {n_tile_h}"
+    #       f"\nTILE_IN_C: {TILE_IN_C}, n_tiles_in_ch: {n_tiles_in_ch}"\
     #       f"\nTILE_OUT_H: {TILE_OUT_H}, TILE_OUT_W: {TILE_OUT_W}"
+    #       f"\nTILE_IN_H: {TILE_IN_H}, TILE_IN_W: {TILE_IN_W}"
     #     )
 
     # Process the images in batches
     for b in nl.affine_range(batch_size):
         for tile_out_ch in nl.affine_range(n_tiles_out_ch):
+            out_ch_start = tile_out_ch * TILE_OUT_C
+            out_ch_end = (tile_out_ch + 1) * TILE_OUT_C
             for tile_h in nl.affine_range(n_tile_h):
                 
                 # Allocate PSUM for this output tile
@@ -105,16 +96,14 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                 
                 for tile_in_ch in nl.affine_range(n_tiles_in_ch):
 
-                    input_tile = nl.ndarray((TILE_IN_C, TILE_H, TILE_W), dtype=X.dtype, buffer=nl.sbuf)
+                    input_tile = nl.ndarray((TILE_IN_C, TILE_IN_H, TILE_IN_W), dtype=X.dtype, buffer=nl.sbuf)
                     ch_start = tile_in_ch * TILE_IN_C
                     ch_end = (tile_in_ch + 1) * TILE_IN_C
-                    h_start = tile_h * TILE_H
-                    h_end = (tile_h + 1) * TILE_H
-                    nisa.dma_copy(src=X[b, ch_start:ch_end, h_start:h_end, :], dst=input_tile)
+                    h_in_start = tile_h * TILE_OUT_H
+                    h_in_end = (tile_h + 1) * TILE_OUT_H + filter_height - 1
+                    nisa.dma_copy(src=X[b, ch_start:ch_end, h_in_start: h_in_end, :], dst=input_tile)
 
                     # Get weight tile to SBUF and transpose
-                    out_ch_start = tile_out_ch * TILE_OUT_C
-                    out_ch_end = (tile_out_ch + 1) * TILE_OUT_C
                     # weight_tile = nl.ndarray((TILE_OUT_C, TILE_IN_C, filter_height, filter_width), dtype=W.dtype, buffer=nl.hbm)
                     # nisa.dma_copy(src=W[out_ch_start:out_ch_end, ch_start:ch_end, :, :], dst=weight_tile)
                     # weight_tile_T = matrix_transpose(weight_tile.reshape((TILE_OUT_C, TILE_IN_C * filter_height * filter_width))).reshape((TILE_IN_C, TILE_OUT_C, filter_height, filter_width))
@@ -132,11 +121,14 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
 
                 # copy from PSUM to SBUF (after all input channels are accumulated)
                 output_tile = nisa.tensor_copy(src=output_tile_psum)
+
+                # add bias
+                bias_tile = nl.ndarray((TILE_OUT_C, 1, 1), dtype=bias.dtype, buffer=nl.sbuf)
+                nisa.dma_copy(src=bias[out_ch_start:out_ch_end], dst=bias_tile)
+                output_tile = nisa.tensor_tensor(output_tile, bias_tile, op=nl.add)
+
                 # Write back the output tile to the output tensor
-                out_h_start = tile_h * TILE_OUT_H
-                out_h_end = (tile_h + 1) * TILE_OUT_H
-                # print("output_tile shape:", output_tile.shape)
-                nisa.dma_copy(src=output_tile, dst=X_out[b, out_ch_start:out_ch_end, out_h_start:out_h_end, :])
+                nisa.dma_copy(src=output_tile, dst=X_out[b, out_ch_start:out_ch_end, tile_h * TILE_OUT_H: (tile_h + 1) * TILE_OUT_H, :])
 
     return X_out
 
