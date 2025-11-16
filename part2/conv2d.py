@@ -114,6 +114,11 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
         for tile_out_ch in nl.affine_range(n_tiles_out_ch):
             out_ch_start = tile_out_ch * TILE_OUT_C
             out_ch_end = (tile_out_ch + 1) * TILE_OUT_C
+
+            output_tile_sbuf = nl.ndarray((TILE_OUT_C, out_height, out_width), dtype=X.dtype, buffer=nl.sbuf)
+
+            bias_tile = nl.ndarray((TILE_OUT_C, 1, 1), dtype=bias.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(src=bias[out_ch_start:out_ch_end], dst=bias_tile)
             for tile_h in nl.affine_range(n_tile_h):
                 
                 # Allocate PSUM for this output tile (accumulate across input channels)
@@ -134,16 +139,11 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
 
                             output_tile_psum += nisa.nc_matmul(W_T[:, tile_idx * PARTITION_DIM:(tile_idx + 1) * PARTITION_DIM, i, j], input_tile[:, i : i + TILE_OUT_H, j : j + TILE_OUT_W])
 
-                # copy from PSUM to SBUF (after all input channels are accumulated)
-                output_tile = nisa.tensor_copy(src=output_tile_psum)
-
                 # add bias
-                bias_tile = nl.ndarray((TILE_OUT_C, 1, 1), dtype=bias.dtype, buffer=nl.sbuf)
-                nisa.dma_copy(src=bias[out_ch_start:out_ch_end], dst=bias_tile)
-                output_tile = nisa.tensor_tensor(output_tile, bias_tile, op=nl.add)
+                output_tile_sbuf[:, tile_h * TILE_OUT_H: (tile_h + 1) * TILE_OUT_H, :] = nisa.tensor_tensor(output_tile_psum, bias_tile, op=nl.add)
 
-                # Write back the output tile to the output tensor
-                nisa.dma_copy(src=output_tile, dst=X_out[b, out_ch_start:out_ch_end, tile_h * TILE_OUT_H: (tile_h + 1) * TILE_OUT_H, :])
+            # Write back the output tile to the output tensor
+            nisa.dma_copy(src=output_tile_sbuf, dst=X_out[b, out_ch_start:out_ch_end, :, :])
 
     return X_out
 
