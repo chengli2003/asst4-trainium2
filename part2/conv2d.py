@@ -86,27 +86,27 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     #     )
 
     # Preprocess weights using tiled transpose
-    W_T = nl.ndarray((PARTITION_DIM, in_channels * out_channels / PARTITION_DIM, filter_height, filter_width), dtype=W.dtype, buffer=nl.sbuf)
+    # W_T = nl.ndarray((PARTITION_DIM, in_channels * out_channels / PARTITION_DIM, filter_height, filter_width), dtype=W.dtype, buffer=nl.sbuf)
     
-    # Process weights in tiles
-    for tile_out in nl.affine_range(out_channels // PARTITION_DIM):
-        for tile_in in nl.affine_range(in_channels // PARTITION_DIM):
-            for h in nl.affine_range(filter_height):
-                for w in nl.affine_range(filter_width):
-                    # Extract tile from original weights
-                    out_start = tile_out * PARTITION_DIM
-                    out_end = (tile_out + 1) * PARTITION_DIM
-                    in_start = tile_in * PARTITION_DIM
-                    in_end = (tile_in + 1) * PARTITION_DIM
+    # # Process weights in tiles
+    # for tile_out in nl.affine_range(out_channels // PARTITION_DIM):
+    #     for tile_in in nl.affine_range(in_channels // PARTITION_DIM):
+    #         for h in nl.affine_range(filter_height):
+    #             for w in nl.affine_range(filter_width):
+    #                 # Extract tile from original weights
+    #                 out_start = tile_out * PARTITION_DIM
+    #                 out_end = (tile_out + 1) * PARTITION_DIM
+    #                 in_start = tile_in * PARTITION_DIM
+    #                 in_end = (tile_in + 1) * PARTITION_DIM
                     
-                    # Load tile: (TILE_TRANSPOSE_OUT, TILE_TRANSPOSE_IN)
-                    weight_tile_hbm = nl.ndarray((PARTITION_DIM, PARTITION_DIM), dtype=W.dtype, buffer=nl.hbm)
-                    nisa.dma_copy(src=W[out_start:out_end, in_start:in_end, h, w], dst=weight_tile_hbm)
+    #                 # Load tile: (TILE_TRANSPOSE_OUT, TILE_TRANSPOSE_IN)
+    #                 weight_tile_hbm = nl.ndarray((PARTITION_DIM, PARTITION_DIM), dtype=W.dtype, buffer=nl.hbm)
+    #                 nisa.dma_copy(src=W[out_start:out_end, in_start:in_end, h, w], dst=weight_tile_hbm)
 
-                    tile_idx = tile_in * n_tiles_out_ch + tile_out
+    #                 tile_idx = tile_in * n_tiles_out_ch + tile_out
                     
-                    # Transpose tile: (TILE_TRANSPOSE_IN, TILE_TRANSPOSE_OUT)
-                    W_T[:, tile_idx * PARTITION_DIM:(tile_idx + 1) * PARTITION_DIM, h, w] = nisa.dma_transpose(weight_tile_hbm, axes=(1, 0))
+    #                 # Transpose tile: (TILE_TRANSPOSE_IN, TILE_TRANSPOSE_OUT)
+    #                 W_T[:, tile_idx * PARTITION_DIM:(tile_idx + 1) * PARTITION_DIM, h, w] = nisa.dma_transpose(weight_tile_hbm, axes=(1, 0))
 
 
     # Process the images in batches
@@ -133,11 +133,19 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                     h_in_end = (tile_h + 1) * TILE_OUT_H + filter_height - 1
                     nisa.dma_copy(src=X[b, ch_start:ch_end, h_in_start: h_in_end, :], dst=input_tile)
 
+                    # load weight tiles and transpose
+                    weight_tile = nl.ndarray((TILE_OUT_C, TILE_IN_C, filter_height, filter_width), dtype=W.dtype, buffer=nl.sbuf)
+                    nisa.dma_copy(src=W[out_ch_start:out_ch_end, ch_start:ch_end, :, :], dst=weight_tile)
+                    weight_tile_T = matrix_transpose(weight_tile.reshape((TILE_OUT_C, TILE_IN_C * filter_height * filter_width))).reshape((TILE_IN_C, filter_height, filter_width, TILE_OUT_C))
+                    # copy to sbuf
+                    weight_tile_T_sbuf = nl.ndarray(weight_tile_T.shape, dtype=weight_tile_T.dtype, buffer=nl.sbuf)
+                    nisa.dma_copy(src=weight_tile_T, dst=weight_tile_T_sbuf)
+
                     for i in nl.affine_range(filter_height):
                         for j in nl.affine_range(filter_width):
                             tile_idx = tile_in_ch * n_tiles_out_ch + tile_out_ch
 
-                            output_tile_psum += nisa.nc_matmul(W_T[:, tile_idx * PARTITION_DIM:(tile_idx + 1) * PARTITION_DIM, i, j], input_tile[:, i : i + TILE_OUT_H, j : j + TILE_OUT_W])
+                            output_tile_psum += nisa.nc_matmul(weight_tile_T_sbuf[:, i, j, :], input_tile[:, i : i + TILE_OUT_H, j : j + TILE_OUT_W])
 
                 # add bias
                 output_tile_sbuf[:, tile_h * TILE_OUT_H: (tile_h + 1) * TILE_OUT_H, :] = nisa.tensor_tensor(output_tile_psum, bias_tile, op=nl.add)
