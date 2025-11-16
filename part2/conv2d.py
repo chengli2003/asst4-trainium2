@@ -136,16 +136,13 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                     # load weight tiles and transpose
                     weight_tile = nl.ndarray((TILE_OUT_C, TILE_IN_C, filter_height, filter_width), dtype=W.dtype, buffer=nl.sbuf)
                     nisa.dma_copy(src=W[out_ch_start:out_ch_end, ch_start:ch_end, :, :], dst=weight_tile)
-                    weight_tile_T = matrix_transpose(weight_tile.reshape((TILE_OUT_C, TILE_IN_C * filter_height * filter_width))).reshape((TILE_IN_C, filter_height, filter_width, TILE_OUT_C))
-                    # copy to sbuf
-                    weight_tile_T_sbuf = nl.ndarray(weight_tile_T.shape, dtype=weight_tile_T.dtype, buffer=nl.sbuf)
-                    nisa.dma_copy(src=weight_tile_T, dst=weight_tile_T_sbuf)
+                    weight_tile_T_sbuf = tensor_transpose_4d(weight_tile)
 
                     for i in nl.affine_range(filter_height):
                         for j in nl.affine_range(filter_width):
                             tile_idx = tile_in_ch * n_tiles_out_ch + tile_out_ch
 
-                            output_tile_psum += nisa.nc_matmul(weight_tile_T_sbuf[:, i, j, :], input_tile[:, i : i + TILE_OUT_H, j : j + TILE_OUT_W])
+                            output_tile_psum += nisa.nc_matmul(weight_tile_T_sbuf[:, :, i, j], input_tile[:, i : i + TILE_OUT_H, j : j + TILE_OUT_W])
 
                 # add bias
                 output_tile_sbuf[:, tile_h * TILE_OUT_H: (tile_h + 1) * TILE_OUT_H, :] = nisa.tensor_tensor(output_tile_psum, bias_tile, op=nl.add)
@@ -158,34 +155,31 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
 
 
 """
-This kernel implements a simple 2D matrix transpose.
-It uses a tile-based approach along with NKI's built-in transpose kernel,
-which only works on tiles of size <= 128x128.
+This kernel implements a 4D tensor transpose that transposes dimensions to (1, 0, 2, 3).
+Input tensor shape: (d0, d1, d2, d3)
+Output tensor shape: (d1, d0, d2, d3)
+Output is stored in SBUF buffer.
 """
 @nki.compiler.skip_middle_end_transformations
 @nki.jit
-def matrix_transpose(a_tensor):
-    M, N = a_tensor.shape
-    out = nl.ndarray((N, M), dtype=a_tensor.dtype, buffer=nl.hbm)
-    tile_dim = nl.tile_size.pmax  # this should be 128
-
-    assert M % tile_dim == N % tile_dim == 0, "Matrix dimensions not divisible by tile dimension!"
-
-    for m in nl.affine_range(M // tile_dim):
-        for n in nl.affine_range(N // tile_dim):
-            # Allocate space for the input tile
-            a_tile = nl.ndarray((tile_dim, tile_dim), dtype=a_tensor.dtype, buffer=nl.sbuf)
+def tensor_transpose_4d(input_tensor):
+    d0, d1, d2, d3 = input_tensor.shape
+    
+    # Output tensor with transposed dimensions (1, 0, 2, 3)
+    out = nl.ndarray((d1, d0, d2, d3), dtype=input_tensor.dtype, buffer=nl.sbuf)
+    
+    # Process each slice along dimensions 2 and 3
+    for i2 in nl.affine_range(d2):
+        for i3 in nl.affine_range(d3):
+            # Extract 2D slice from input: shape (d0, d1)
+            input_slice = nisa.tensor_copy(src=input_tensor[:, :, i2, i3])
             
-            # Load the tile from the input tensor
-            nisa.dma_copy(src=a_tensor[m * tile_dim : (m + 1) * tile_dim, n * tile_dim : (n + 1) * tile_dim], dst=a_tile)
+            # Transpose the 2D slice using the existing matrix transpose logic
+            transposed_psum = nisa.nc_transpose(input_slice)
 
-            # Transpose the tile (this outputs to PSUM)
-            transposed_psum = nisa.nc_transpose(a_tile)
-            
-            # Copy from PSUM to SBUF
             transposed_tile = nisa.tensor_copy(src=transposed_psum)
-
-            # Store the transposed tile into the output tensor
-            nisa.dma_copy(src=transposed_tile, dst=out[n * tile_dim : (n + 1) * tile_dim, m * tile_dim : (m + 1) * tile_dim])
-
+            
+            # Store the transposed slice in the output tensor
+            out[:, :, i2, i3] = nisa.tensor_copy(src=transposed_tile)
+    
     return out
