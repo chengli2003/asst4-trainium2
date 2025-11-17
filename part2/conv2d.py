@@ -78,36 +78,12 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     n_tile_h = out_height // TILE_OUT_H
     PARTITION_DIM = 128
 
-    # print(f"Fused Conv2D-MaxPool Tiling Info:"
-    #       f"\nTILE_OUT_C: {TILE_OUT_C}, n_tiles_out_ch: {n_tiles_out_ch}"
-    #       f"\nTILE_IN_C: {TILE_IN_C}, n_tiles_in_ch: {n_tiles_in_ch}"\
-    #       f"\nTILE_OUT_H: {TILE_OUT_H}, TILE_OUT_W: {TILE_OUT_W}"
-    #       f"\nTILE_IN_H: {TILE_IN_H}, TILE_IN_W: {TILE_IN_W}"
-    #     )
-
-    # Preprocess weights using tiled transpose
-    # W_T = nl.ndarray((PARTITION_DIM, in_channels * out_channels / PARTITION_DIM, filter_height, filter_width), dtype=W.dtype, buffer=nl.sbuf)
-    
-    # # Process weights in tiles
-    # for tile_out in nl.affine_range(out_channels // PARTITION_DIM):
-    #     for tile_in in nl.affine_range(in_channels // PARTITION_DIM):
-    #         for h in nl.affine_range(filter_height):
-    #             for w in nl.affine_range(filter_width):
-    #                 # Extract tile from original weights
-    #                 out_start = tile_out * PARTITION_DIM
-    #                 out_end = (tile_out + 1) * PARTITION_DIM
-    #                 in_start = tile_in * PARTITION_DIM
-    #                 in_end = (tile_in + 1) * PARTITION_DIM
-                    
-    #                 # Load tile: (TILE_TRANSPOSE_OUT, TILE_TRANSPOSE_IN)
-    #                 weight_tile_hbm = nl.ndarray((PARTITION_DIM, PARTITION_DIM), dtype=W.dtype, buffer=nl.hbm)
-    #                 nisa.dma_copy(src=W[out_start:out_end, in_start:in_end, h, w], dst=weight_tile_hbm)
-
-    #                 tile_idx = tile_in * n_tiles_out_ch + tile_out
-                    
-    #                 # Transpose tile: (TILE_TRANSPOSE_IN, TILE_TRANSPOSE_OUT)
-    #                 W_T[:, tile_idx * PARTITION_DIM:(tile_idx + 1) * PARTITION_DIM, h, w] = nisa.dma_transpose(weight_tile_hbm, axes=(1, 0))
-
+    # copy bias to SBUF once
+    bias_sbuf = nl.ndarray((TILE_OUT_C, n_tiles_out_ch), dtype=bias.dtype, buffer=nl.sbuf)
+    for tile_out_ch in nl.affine_range(n_tiles_out_ch):
+        out_ch_start = tile_out_ch * TILE_OUT_C
+        out_ch_end = (tile_out_ch + 1) * TILE_OUT_C
+        nisa.dma_copy(src=bias[out_ch_start:out_ch_end], dst=bias_sbuf[:, tile_out_ch])
 
     # Process the images in batches
     for b in nl.affine_range(batch_size):
@@ -117,8 +93,10 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
 
             output_tile_sbuf = nl.ndarray((TILE_OUT_C, out_height, out_width), dtype=X.dtype, buffer=nl.sbuf)
 
+            # reshape to (TILE_OUT_C, 1, 1)
             bias_tile = nl.ndarray((TILE_OUT_C, 1, 1), dtype=bias.dtype, buffer=nl.sbuf)
-            nisa.dma_copy(src=bias[out_ch_start:out_ch_end], dst=bias_tile)
+            nisa.dma_copy(src=bias_sbuf[:, tile_out_ch], dst=bias_tile)
+
             for tile_h in nl.affine_range(n_tile_h):
                 
                 # Allocate PSUM for this output tile (accumulate across input channels)
